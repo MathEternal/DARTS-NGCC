@@ -1,0 +1,73 @@
+#include <stddef.h>
+#include <stdint.h>
+#include <stdio.h>
+#include "../randombytes.h"
+#include "../sign.h"
+
+#define MLEN 66
+#define NTESTS 1000
+
+int main(void)
+{
+  unsigned int i, j;
+  int ret;
+  size_t mlen, smlen;
+  uint8_t m[MLEN] = {0};
+  uint8_t sm[MLEN + CRYPTO_SIGNATUREBYTES];
+  uint8_t m2[MLEN + CRYPTO_SIGNATUREBYTES];
+  uint8_t pk[CRYPTO_PUBLICKEYBYTES];
+  uint8_t sk[CRYPTO_SECRETKEYBYTES] = {0};
+
+  /* The attached-signature API must reject an overflowing output length
+   * before it reads the message or secret key. */
+  smlen = SIZE_MAX;
+  ret = crypto_sign_sign(sm, &smlen, m,
+                         SIZE_MAX - CRYPTO_SIGNATUREBYTES + 1, sk);
+  if(ret != -1 || smlen != 0) {
+    fprintf(stderr, "Oversized message was not rejected\n");
+    return -1;
+  }
+
+  for(i = 0; i < NTESTS; ++i) {
+    randombytes(m, MLEN);
+
+    crypto_sign_keypair(pk, sk);
+    crypto_sign_sign(sm, &smlen, m, MLEN, sk);
+    ret = crypto_sign_open(m2, &mlen, sm, smlen, pk);
+
+    if(ret) {
+      fprintf(stderr, "Verification failed\n");
+      return -1;
+    }
+
+    if(mlen != MLEN) {
+      fprintf(stderr, "Message lengths don't match\n");
+      return -1;
+    }
+
+    for(j = 0; j < mlen; ++j) {
+      if(m[j] != m2[j]) {
+        fprintf(stderr, "Messages don't match\n");
+        return -1;
+      }
+    }
+
+    randombytes((uint8_t *)&j, sizeof(j));
+    do {
+      randombytes(m2, 1);
+    } while(!m2[0]);
+    sm[j % CRYPTO_SIGNATUREBYTES] += m2[0];
+    ret = crypto_sign_open(m2, &mlen, sm, smlen, pk);
+    if(!ret) {
+      fprintf(stderr, "Trivial forgeries possible\n");
+      return -1;
+    }
+  }
+
+  printf("All tests passed\n");
+  printf("CRYPTO_PUBLICKEYBYTES = %d\n", CRYPTO_PUBLICKEYBYTES);
+  printf("CRYPTO_SECRETKEYBYTES = %d\n", CRYPTO_SECRETKEYBYTES);
+  printf("CRYPTO_SIGNATUREBYTES = %d\n", CRYPTO_SIGNATUREBYTES);
+
+  return 0;
+}

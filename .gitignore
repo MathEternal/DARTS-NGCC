@@ -1,0 +1,17 @@
+**/bin/
+**/output/
+**/__pycache__/
+*.py[cod]
+*.o
+*.obj
+*.a
+*.so
+*.so.*
+*.dylib
+*.dll
+*.exe
+*.gcda
+*.gcno
+perf.data
+perf.data.old
+.DS_Store
