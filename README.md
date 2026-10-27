@@ -8,4 +8,4 @@ This repository contains the updated implementation and algorithm specification 
 - `Test_Vectors/`: known-answer test vectors.
 - `Algorithm specification (Version 2.0).pdf`: Version 2.0 algorithm specification.
 
-See `Implementations/README.md` for implementation details. Generated binaries, build outputs, and profiling data are not tracked.
+See `Implementations/README.md` for implementation details.
