@@ -52,7 +52,13 @@ int sig_sign(
 	unsigned char *m, unsigned long long m_len_bytes,
 	unsigned char *sn, unsigned long long *sn_len_bytes)
 {
-	(void)sk_len_bytes; // ICCS API 传入私钥长度，内部不需要使用
+	// Reject secret keys whose declared length does not match the
+	// parameter set: unpack_sk() reads CRYPTO_SECRETKEYBYTES bytes
+	// unconditionally, so a truncated buffer would be read out of
+	// bounds before any check could reject it.
+	if (sk_len_bytes != (unsigned long long)CRYPTO_SECRETKEYBYTES) {
+		return -1;
+	}
 
 	size_t siglen = 0;
 	int ret = crypto_sign_signature(sn, &siglen, m, (size_t)m_len_bytes, sk);
@@ -67,7 +73,14 @@ int sig_verify(
 	unsigned char *sn, unsigned long long sn_len_bytes,
 	unsigned char *m, unsigned long long m_len_bytes)
 {
-	(void)pk_len_bytes; // ICCS API 传入公钥长度，内部不需要使用
+	// Reject public keys whose declared length does not match the
+	// parameter set: unpack_pk() reads CRYPTO_PUBLICKEYBYTES bytes
+	// unconditionally, so a shorter buffer is read out of bounds
+	// (heap-buffer-overflow READ under ASan) and a zero-length
+	// public key used to be accepted.
+	if (pk_len_bytes != (unsigned long long)CRYPTO_PUBLICKEYBYTES) {
+		return -1;
+	}
 
 	return crypto_sign_verify(sn, (size_t)sn_len_bytes, m, (size_t)m_len_bytes, pk);
 }
