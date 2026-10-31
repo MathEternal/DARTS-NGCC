@@ -354,10 +354,9 @@ int baseinv_avx(__m256i *vb_out, __m256i va, __m256i vzeta) {
     t2 = _mm256_sub_epi32(fqmul_avx(t0, t0), fqmul_avx(t2, vzeta));
 
     __m256i vzero = _mm256_setzero_si256();
+    /* Branchless degenerate handling, same form as poly_baseinv above. */
     __m256i cmp = _mm256_cmpeq_epi32(t2, vzero);
-    if (!_mm256_testz_si256(cmp, cmp)) {
-        return -1; 
-    }
+    int degenerate = !_mm256_testz_si256(cmp, cmp);
 
     t2 = fqinv_avx(t2);
 
@@ -380,5 +379,5 @@ int baseinv_avx(__m256i *vb_out, __m256i va, __m256i vzeta) {
     __m256i mix23 = _mm256_blend_epi32(b2, b3, 0x88);
     *vb_out = _mm256_blend_epi32(mix01, mix23, 0xCC); 
 
-    return 0; 
+    return -degenerate;
 }

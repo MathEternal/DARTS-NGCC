@@ -403,7 +403,7 @@ int poly_baseinv(poly *b, const poly *a) {
         __m256i vzeta = _mm256_set_epi32(-zeta, -zeta, -zeta, -zeta, 
                                           zeta,  zeta,  zeta,  zeta);
         __m256i va = _mm256_loadu_si256((__m256i *)&a->coeffs[8 * i]);
-        __m256i vb = vzero;
+        __m256i vb;
         __m256i a0 = _mm256_shuffle_epi32(va, 0x00);
         __m256i a1 = _mm256_shuffle_epi32(va, 0x55);
         __m256i a2 = _mm256_shuffle_epi32(va, 0xAA);
@@ -422,12 +422,13 @@ int poly_baseinv(poly *b, const poly *a) {
         __m256i t2 = fqmul_avx(t1, t1);
         t2 = _mm256_sub_epi32(fqmul_avx(t0, t0), fqmul_avx(t2, vzeta));
 
+        /* Branchless degenerate-group handling: fold the zero-test into
+         * the result accumulator instead of branching on secret data, and
+         * always run the inversion.  fqinv(0) == 0, so a degenerate group
+         * still yields the all-zero output block the branch used to store;
+         * this matches the mask form of the Reference/NEON trees. */
         __m256i cmp = _mm256_cmpeq_epi32(t2, vzero);
-        if (!_mm256_testz_si256(cmp, cmp)) {
-            result -= 1; 
-            _mm256_storeu_si256((__m256i *)&b->coeffs[8 * i], vb);
-            continue; 
-        }
+        result -= !_mm256_testz_si256(cmp, cmp);
 
         t2 = fqinv_avx(t2);
         t0 = montgomery_reduce_avx(fqmul_avx(t0, t2));
