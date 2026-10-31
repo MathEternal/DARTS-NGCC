@@ -1,4 +1,5 @@
 #include "polyfix.h"
+#include "zeroize.h"
 #include "math.h"
 #include "ntt.h"
 #include "params.h"
@@ -507,7 +508,12 @@ uint16_t polyfixveclk_sample_hyperball(polyfixvecl *y1, polyfixveck *y2, uint8_t
       tmp[CRHBYTES + 0] = ni >> 0;
       tmp[CRHBYTES + 1] = ni >> 8;
       shake256(b, 1, tmp, CRHBYTES+2);
+      darts_zeroize(tmp, sizeof(tmp));
     }
+
+    /* Erase the sampled y material before returning. */
+    darts_zeroize(samples, sizeof(samples));
+    darts_zeroize(signs, sizeof(signs));
 
     return ni;
 }

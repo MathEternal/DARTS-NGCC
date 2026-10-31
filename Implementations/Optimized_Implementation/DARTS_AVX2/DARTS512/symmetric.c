@@ -1,4 +1,5 @@
 #include "symmetric.h"
+#include "zeroize.h"
 #include "auxfunc.h"
 #include <string.h>
 #include <stdlib.h>
@@ -28,6 +29,8 @@ void sm3_xof_absorb_twice(sm3_xof_state *state,
     pseudohash(512, combined, (unsigned long long)total * 8, state->derived_seed);
     state->block_counter = 0;
 
+    /* combined holds (kappa || mu); erase before release. */
+    darts_zeroize(combined, total);
     free(combined);
 }
 
@@ -47,6 +50,7 @@ void sm3_xof_squeezeblocks(uint8_t *out, size_t nblocks,
     pseudoXOF((unsigned long long)nblocks * 1024,
               tmp, 68ULL * 8, out);
 
+    darts_zeroize(tmp, sizeof(tmp));
     state->block_counter += (uint32_t)nblocks;
 }
 
@@ -67,6 +71,7 @@ void sm3_xof_squeeze(uint8_t *out, size_t outlen,
               tmp, 68ULL * 8, out);
 
     size_t nblocks = (outlen + 127) / 128;
+    darts_zeroize(tmp, sizeof(tmp));
     state->block_counter += (uint32_t)nblocks;
 }
 
@@ -83,6 +88,9 @@ void sm3_xof_stream_init(sm3_xof_state *state,
     pseudohash(512, tmp, (unsigned long long)(seedlen + 2) * 8,
                state->derived_seed);
     state->block_counter = 0;
+
+    /* tmp holds the secret sampling seed. */
+    darts_zeroize(tmp, sizeof(tmp));
 }
 
 void sm3_shake256(uint8_t *out, size_t outlen,

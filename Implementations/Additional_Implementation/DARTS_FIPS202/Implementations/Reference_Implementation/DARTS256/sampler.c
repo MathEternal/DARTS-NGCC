@@ -1,4 +1,5 @@
 #include "sampler.h"
+#include "zeroize.h"
 #include "fixpoint.h"
 #include "gauss_q80_constants.h"
 #include "symmetric.h"
@@ -380,4 +381,7 @@ void sample_gauss_N(uint64_t *r, uint8_t *signs, fp96_76 *sqsum,
         coefcnt += sample_gauss(r + coefcnt, sqsum, buf, bytecnt, len - coefcnt, len%N);
         firstflag = 0;
     }
+
+    /* Erase the Gaussian sampling stream (secret y material). */
+    darts_zeroize(buf, sizeof(buf));
 }
