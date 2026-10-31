@@ -1,9 +1,10 @@
 #include "sampler.h"
+#include "zeroize.h"
 #include "fixpoint.h"
 #include "gauss_q80_constants.h"
 #include "symmetric.h"
 #include <stdint.h>
-
+#include <arm_neon.h>
 /*************************************************
  * Name:        rej_uniform
  *
@@ -221,7 +222,7 @@ unsigned int rej_p(int32_t *a, unsigned int len,
 }
 
 /* Q63 one-sided degree-12 approximation of exp(-x). */
-static uint64_t approx_exp(const uint64_t x) {
+static inline __attribute__((always_inline)) uint64_t approx_exp(const uint64_t x) {
     int64_t result = EXP_C12;
     uint64_t threshold;
 
@@ -246,7 +247,7 @@ static uint64_t approx_exp(const uint64_t x) {
 }
 
 /* Constant-time inverse-CDF sampling from the generated 112-bit CDT. */
-static uint64_t sample_gauss112(const uint64_t rand_lo,
+static inline __attribute__((always_inline)) uint64_t sample_gauss112(const uint64_t rand_lo,
                                 const uint64_t rand_hi) {
     unsigned int i;
     uint64_t r = 0;
@@ -259,7 +260,53 @@ static uint64_t sample_gauss112(const uint64_t rand_lo,
     return r;
 }
 
-static uint64_t load64_le(const uint8_t src[8]) {
+/* Fused CDF scan of four attempts in one NEON loop over the shared CDT
+ * tables: each attempt owns a 2x64-bit-lane accumulator whose lanes cover
+ * the even/odd CDT entries of the block, and the rand value is splatted
+ * into both lanes. Per (entry, attempt) the lane arithmetic is identical
+ * to the scalar loop above (same borrow, same subtract, same sign test);
+ * the two lane sums are combined with one exact horizontal 64-bit add, so
+ * each x[k] equals the scalar count bit-for-bit. CDTLEN is odd (195): the
+ * last entry is handled by the scalar tail. */
+static inline __attribute__((always_inline)) void sample_gauss112_4x(
+    uint64_t x[4], const uint64_t rand_lo[4], const uint64_t rand_hi[4]) {
+    uint64x2_t acc[4];
+    uint64x2_t vrh[4], vrl[4];
+    unsigned int i;
+    unsigned int k;
+
+    for (k = 0; k < 4; k++) {
+        acc[k] = vdupq_n_u64(0);
+        vrl[k] = vdupq_n_u64(rand_lo[k]);
+        vrh[k] = vdupq_n_u64(rand_hi[k]);
+    }
+
+    for (i = 0; i + 2 <= CDTLEN; i += 2) {
+        const uint64x2_t vlo = vld1q_u64(&CDT112_LO[i]);
+        const uint64x2_t vhi = vld1q_u64(&CDT112_HI[i]);
+        uint64x2_t d;
+
+        for (k = 0; k < 4; k++) {
+            d = vsubq_u64(vhi, vrh[k]);
+            d = vsubq_u64(d, vshrq_n_u64(vcgtq_u64(vrl[k], vlo), 63));
+            acc[k] = vaddq_u64(acc[k], vshrq_n_u64(d, 63));
+        }
+    }
+    x[0] = vaddvq_u64(acc[0]);
+    x[1] = vaddvq_u64(acc[1]);
+    x[2] = vaddvq_u64(acc[2]);
+    x[3] = vaddvq_u64(acc[3]);
+
+    for (; i < CDTLEN; i++) {
+        for (k = 0; k < 4; k++) {
+            const uint64_t borrow = rand_lo[k] > CDT112_LO[i];
+            const uint64_t hi_diff = CDT112_HI[i] - rand_hi[k] - borrow;
+            x[k] += hi_diff >> 63;
+        }
+    }
+}
+
+static inline __attribute__((always_inline)) uint64_t load64_le(const uint8_t src[8]) {
     return (uint64_t)src[0] | ((uint64_t)src[1] << 8) |
            ((uint64_t)src[2] << 16) | ((uint64_t)src[3] << 24) |
            ((uint64_t)src[4] << 32) | ((uint64_t)src[5] << 40) |
@@ -268,19 +315,52 @@ static uint64_t load64_le(const uint8_t src[8]) {
 
 #define GAUSS_RAND (72 + CDT_BITS + 64)
 #define GAUSS_RAND_BYTES ((GAUSS_RAND + 7) / 8) /* 31 */
-static int sample_gauss_sigma76(uint64_t *r, fp96_76 *sqr,
-                                const uint8_t rand[GAUSS_RAND_BYTES]) {
-    const uint64_t rand_gauss_lo = load64_le(rand);
-    const uint64_t rand_gauss_hi = load64_le(rand + 8) &
-                                   ((UINT64_C(1) << 48) - 1);
-    const uint64_t rejection_word = load64_le(rand + 14);
+
+/* File-private inlined copy of fixpoint_square (body verbatim from
+ * fixpoint.c): the batched retry loop needs it inlined into gauss_finish,
+ * but the header-inline version changed the compilation layout of every
+ * including TU (128 keygen -2.5% via the fixpoint.c Newton loop). Only
+ * this sampler TU sees the inline; all other callers keep the external
+ * definition. */
+static inline __attribute__((always_inline)) void fixpoint_square_sampler(
+    fp96_76 *sqx, const fp96_76 *x) {
+    uint64_t tmp[2];
+    sq48(&sqx->limb48[0], x->limb48[0]);
+
+    // shift right by 48, rounding
+    //sqx->limb48[0] += 1ULL << 47;
+    sqx->limb48[0] >>= 48;
+    sqx->limb48[0] += sqx->limb48[1];
+
+    // mul
+    mul48(tmp, x->limb48[0], x->limb48[1]);
+    sqx->limb48[0] += tmp[0] << 1;
+    sqx->limb48[1] = tmp[1] << 1;
+
+    // shift right by 28, rounding
+    //sqx->limb48[0] += 1ULL << 27;
+    sqx->limb48[0] >>= 28;
+    sqx->limb48[0] += (sqx->limb48[1] << 20) & ((1ULL << 48) - 1);
+    sqx->limb48[1] >>= 28;
+
+    sq64(tmp, x->limb48[1]);
+    sqx->limb48[0] += (tmp[0] << 20) & ((1ULL << 48) - 1);
+    sqx->limb48[1] += (tmp[0] >> 28) + (tmp[1] << 36);
+
+    renormalize(sqx);
+}
+
+/* Everything of sample_gauss_sigma76 after the CDT lookup: y construction,
+ * rounding, y*y, exp input, rejection draw. Split out so the batched loop
+ * can share one fused CDT scan across four attempts. Expressions are
+ * identical to the scalar version. */
+static inline __attribute__((always_inline)) int gauss_finish(
+    uint64_t *r, fp96_76 *sqr, const uint8_t rand[GAUSS_RAND_BYTES],
+    const uint64_t rejection_word, const uint64_t x) {
     const uint64_t rand_rej = rejection_word & INT64_MAX;
     const uint64_t zero_coin = rejection_word >> 63;
-    uint64_t x, exp_in, exp_threshold, diff_hi;
+    uint64_t exp_in, exp_threshold, diff_hi;
     fp96_76 y;
-
-    // sample x
-    x = sample_gauss112(rand_gauss_lo, rand_gauss_hi);
 
     // y := append x to y
     // leave 16 bit for carries
@@ -293,7 +373,7 @@ static int sample_gauss_sigma76(uint64_t *r, fp96_76 *sqr,
     *r += y.limb48[1] << 32;
 
     // sqr := y*y
-    fixpoint_square(sqr, &y);
+    fixpoint_square_sampler(sqr, &y);
 
     /* If D=(sqr-x^2*2^68), Q63 exp_in is round(D/2^14). */
     diff_hi = sqr->limb48[1] - ((x * x) << 20);
@@ -305,6 +385,17 @@ static int sample_gauss_sigma76(uint64_t *r, fp96_76 *sqr,
                  (((*r | (UINT64_C(0) - *r)) >> 63) | zero_coin));
 }
 
+static inline __attribute__((always_inline)) int sample_gauss_sigma76(uint64_t *r, fp96_76 *sqr,
+                                const uint8_t rand[GAUSS_RAND_BYTES]) {
+    const uint64_t rand_gauss_lo = load64_le(rand);
+    const uint64_t rand_gauss_hi = load64_le(rand + 8) &
+                                   ((UINT64_C(1) << 48) - 1);
+    const uint64_t rejection_word = load64_le(rand + 14);
+    const uint64_t x = sample_gauss112(rand_gauss_lo, rand_gauss_hi);
+
+    return gauss_finish(r, sqr, rand, rejection_word, x);
+}
+
 int sample_gauss(uint64_t *r, fp96_76 *sqsum, const uint8_t *buf, const size_t buflen, const size_t len, const int dont_write_last)
 {
     const uint8_t *pos = buf;
@@ -312,7 +403,55 @@ int sample_gauss(uint64_t *r, fp96_76 *sqsum, const uint8_t *buf, const size_t b
     size_t bytecnt = buflen, coefcnt = 0;
     int accepted;
     uint64_t dummy;
-    
+
+    /* 4-way attempt batching. The guard coefcnt + 4 <= len keeps all
+     * written slots coefcnt..coefcnt+3 strictly below len, and only the
+     * attempt-3 slot can reach slot len-1 (prefix p_k <= k <= 3). */
+    while (coefcnt + 4 <= len && bytecnt >= 4 * GAUSS_RAND_BYTES) {
+        uint64_t r0, r1, r2, r3;
+        fp96_76 s0, s1, s2, s3;
+        uint64_t x[4];
+        uint64_t rand_lo[4], rand_hi[4], rej[4];
+        int a0, a1, a2, a3;
+        uint64_t p1, p2, p3;
+
+        for (unsigned int k = 0; k < 4; k++) {
+            rand_lo[k] = load64_le(pos + k * GAUSS_RAND_BYTES);
+            rand_hi[k] = load64_le(pos + k * GAUSS_RAND_BYTES + 8) &
+                         ((UINT64_C(1) << 48) - 1);
+            rej[k] = load64_le(pos + k * GAUSS_RAND_BYTES + 14);
+        }
+        sample_gauss112_4x(x, rand_lo, rand_hi);
+        a0 = gauss_finish(&r0, &s0, pos, rej[0], x[0]);
+        a1 = gauss_finish(&r1, &s1, pos + GAUSS_RAND_BYTES, rej[1], x[1]);
+        a2 = gauss_finish(&r2, &s2, pos + 2 * GAUSS_RAND_BYTES, rej[2], x[2]);
+        a3 = gauss_finish(&r3, &s3, pos + 3 * GAUSS_RAND_BYTES, rej[3], x[3]);
+        p1 = (uint64_t)a0;
+        p2 = p1 + (uint64_t)a1;
+        p3 = p2 + (uint64_t)a2;
+        /* Write slots = prefix-accept counts (a rejected attempt's dead
+         * write is overwritten by the next accepted attempt, matching the
+         * sequential loop; only slots < coefcnt+4 are ever read). */
+        r[coefcnt] = r0;
+        r[coefcnt + p1] = r1;
+        r[coefcnt + p2] = r2;
+        if (!(dont_write_last && coefcnt + p3 == len - 1)) {
+            r[coefcnt + p3] = r3; /* replicate the dummy branch for slot len-1 */
+        }
+        coefcnt += p3 + (uint64_t)a3;
+        pos += 4 * GAUSS_RAND_BYTES;
+        bytecnt -= 4 * GAUSS_RAND_BYTES;
+
+        sqsum->limb48[0] += (s0.limb48[0] & -(int64_t)a0) +
+                            (s1.limb48[0] & -(int64_t)a1) +
+                            (s2.limb48[0] & -(int64_t)a2) +
+                            (s3.limb48[0] & -(int64_t)a3);
+        sqsum->limb48[1] += (s0.limb48[1] & -(int64_t)a0) +
+                            (s1.limb48[1] & -(int64_t)a1) +
+                            (s2.limb48[1] & -(int64_t)a2) +
+                            (s3.limb48[1] & -(int64_t)a3);
+    }
+
     while (coefcnt < len) {
         if (bytecnt < GAUSS_RAND_BYTES) {
           renormalize(sqsum);
@@ -380,4 +519,7 @@ void sample_gauss_N(uint64_t *r, uint8_t *signs, fp96_76 *sqsum,
         coefcnt += sample_gauss(r + coefcnt, sqsum, buf, bytecnt, len - coefcnt, len%N);
         firstflag = 0;
     }
+
+    /* Erase the Gaussian sampling stream (secret y material). */
+    darts_zeroize(buf, sizeof(buf));
 }

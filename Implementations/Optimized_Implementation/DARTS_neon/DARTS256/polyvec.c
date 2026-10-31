@@ -530,13 +530,12 @@ void polyvecl_invntt_tomont(polyvecl *r) {
  **************************************************/
 void polyvecl_basemul_acc_montgomery(poly *r, const polyvecl *a, const polyvecl *b) {
     unsigned int i;
-    poly t;
 
     poly_basemul_montgomery(r, &a->vec[0], &b->vec[0]);
 
+    /* 融合累加：等价于 basemul 到临时 t 后 poly_add(r,r,t)，省整趟临时存取 */
     for (i = 1; i < L; ++i) {
-        poly_basemul_montgomery(&t, &a->vec[i], &b->vec[i]);
-        poly_add(r, r, &t);
+        poly_basemul_acc_montgomery(r, &a->vec[i], &b->vec[i]);
     }
 }
 

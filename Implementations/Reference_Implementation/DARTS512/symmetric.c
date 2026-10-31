@@ -1,7 +1,9 @@
 #include "symmetric.h"
+#include "zeroize.h"
 #include "auxfunc.h"
 #include <string.h>
 #include <stdlib.h>
+#include <stdio.h>
 
 void sm3_xof_absorb_once(sm3_xof_state *state,
                          const uint8_t *in, size_t inlen)
@@ -16,10 +18,21 @@ void sm3_xof_absorb_twice(sm3_xof_state *state,
                           const uint8_t *in2, size_t in2len)
 {
     size_t total = in1len + in2len;
-    uint8_t *combined = (uint8_t *)malloc(total);
+    /* malloc(0) may legitimately return NULL; the in-tree callers always
+       pass a positive total, but never request zero bytes so that a NULL
+       return unambiguously means allocation failure. */
+    uint8_t *combined = (uint8_t *)malloc(total != 0 ? total : 1);
     if (combined == NULL) {
-        memset(state, 0, sizeof(*state));
-        return;
+        /* An allocation failure must not silently degrade the XOF state:
+           zeroing the state and returning made every downstream hash and
+           matrix expansion run on a constant, producing wrong (yet
+           self-consistent) signatures or verifications. The function is
+           void and its callers (including poly_challenge() via
+           xof256_absorbe_twice()) provide no error path, so abort loudly
+           with a diagnostic instead. */
+        fprintf(stderr, "sm3_xof_absorb_twice: malloc of %zu bytes failed\n",
+                total);
+        abort();
     }
     memcpy(combined, in1, in1len);
     memcpy(combined + in1len, in2, in2len);
@@ -28,6 +41,8 @@ void sm3_xof_absorb_twice(sm3_xof_state *state,
     pseudohash(512, combined, (unsigned long long)total * 8, state->derived_seed);
     state->block_counter = 0;
 
+    /* combined holds (kappa || mu); erase before release. */
+    darts_zeroize(combined, total);
     free(combined);
 }
 
@@ -47,6 +62,7 @@ void sm3_xof_squeezeblocks(uint8_t *out, size_t nblocks,
     pseudoXOF((unsigned long long)nblocks * 1024,
               tmp, 68ULL * 8, out);
 
+    darts_zeroize(tmp, sizeof(tmp));
     state->block_counter += (uint32_t)nblocks;
 }
 
@@ -67,6 +83,7 @@ void sm3_xof_squeeze(uint8_t *out, size_t outlen,
               tmp, 68ULL * 8, out);
 
     size_t nblocks = (outlen + 127) / 128;
+    darts_zeroize(tmp, sizeof(tmp));
     state->block_counter += (uint32_t)nblocks;
 }
 
@@ -83,6 +100,9 @@ void sm3_xof_stream_init(sm3_xof_state *state,
     pseudohash(512, tmp, (unsigned long long)(seedlen + 2) * 8,
                state->derived_seed);
     state->block_counter = 0;
+
+    /* tmp holds the secret sampling seed. */
+    darts_zeroize(tmp, sizeof(tmp));
 }
 
 void sm3_shake256(uint8_t *out, size_t outlen,

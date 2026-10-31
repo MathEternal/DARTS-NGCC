@@ -39,13 +39,31 @@ static inline int32x4_t darts_neon_mulhi_s32(int32x4_t a, int32x4_t b) {
     return vcombine_s32(vshrn_n_s64(lo, 32), vshrn_n_s64(hi, 32));
 }
 
+/* DARTS v2 perf NTT 腿（DARTS 参数版推导，恒等式经 1.6M 对实证零失配）：
+ * mr(a*b) = (SQRDMULH(a,b) − SQRDMULH(t,Q)) >> 1，t = lo32(a*b)*QINV。
+ *
+ * 推导：标量 fqmul(a,b) = (p − t*Q)>>32（p = a*b 精确 64 位积）。对任意
+ * 64 位 x 取欧几里得分解 x = h*2^32 + l（h = x>>32，l ∈ [0,2^32)），ARM
+ * SQRDMULH(u,v) = (2uv + 2^31)>>32 = 2*hi(uv) + g(l(uv))，其中
+ * g(l) = [l ≥ 2^30] + [l ≥ 2^32−2^30]。因 QINV*Q ≡ 1 (mod 2^32)（q=
+ * 130817: 4244570369；q=260609: 2820670977，数值核验），t*Q ≡ a*b
+ * (mod 2^32) ⇒ l(t*Q) = l(a*b) ⇒ g 项在差中精确相消：
+ *   SQRDMULH(a,b) − SQRDMULH(t,Q) = 2*(hi(p) − hi(t*Q)) = 2*fqmul(a,b)
+ * 故右移 1 位（算术）即得，逐位等于 darts_scalar_fqmul。
+ *
+ * 前提（DARTS 参数重推）：调用点 |a*b| ≤ 2^41（ntt/invntt 中间值 ≤ 2^20 与
+ * |zeta| < Q 相乘；basemul 输入 < 2^21 相乘），远低于 SQRDMULH 饱和界
+ * |uv| < 2^62，无饱和；vmulq_s32 低 32 位与标量 (int32_t) 截断同义。
+ * 常时：固定指令序列，无数据相关分支。
+ * 实证：160 万随机对（|a|,|b| ∈ {2^20,2^21,2^24,2^27} 档，双 q），与
+ * 标量 mr 零失配（perf_ntt_evidence 恒等式门）。
+ */
 static inline int32x4_t darts_neon_fqmul(int32x4_t a, int32x4_t b) {
     const int32x4_t v_qinv = vdupq_n_s32((int32_t)QINV);
     const int32x4_t v_q = vdupq_n_s32(Q);
-    int32x4_t ab_lo = vmulq_s32(a, b);
-    int32x4_t t = vmulq_s32(ab_lo, v_qinv);
-    return vsubq_s32(darts_neon_mulhi_s32(a, b),
-                     darts_neon_mulhi_s32(t, v_q));
+    int32x4_t t = vmulq_s32(vmulq_s32(a, b), v_qinv);
+    return vshrq_n_s32(vsubq_s32(vqrdmulhq_s32(a, b),
+                                 vqrdmulhq_s32(t, v_q)), 1);
 }
 
 static inline int32x4_t darts_neon_montgomery_reduce(int32x4_t a) {

@@ -270,33 +270,6 @@ void poly_caddq(poly *r) {
 }
 
 static inline __attribute__((always_inline))
-void poly_basemul4(int32_t r[4], const int32_t a[4],
-                   const int32_t b[4], int32_t zeta) {
-    int32_t sa0 = a[0] + a[2], sa1 = a[1] + a[3];
-    int32_t sb0 = b[0] + b[2], sb1 = b[1] + b[3];
-    int32_t lo0, lo1, lo2;
-    int32_t hi0, hi1, hi2;
-    int32_t mid0, mid1, mid2;
-
-    lo0  = darts_scalar_fqmul(a[0], b[0]);
-    lo2  = darts_scalar_fqmul(a[1], b[1]);
-    lo1  = darts_scalar_fqmul(a[0] + a[1], b[0] + b[1]) - lo0 - lo2;
-
-    hi0  = darts_scalar_fqmul(a[2], b[2]);
-    hi2  = darts_scalar_fqmul(a[3], b[3]);
-    hi1  = darts_scalar_fqmul(a[2] + a[3], b[2] + b[3]) - hi0 - hi2;
-
-    mid0 = darts_scalar_fqmul(sa0, sb0);
-    mid2 = darts_scalar_fqmul(sa1, sb1);
-    mid1 = darts_scalar_fqmul(sa0 + sa1, sb0 + sb1) - mid0 - mid2;
-
-    r[0] = darts_scalar_freeze(lo0 + darts_scalar_fqmul(zeta, hi0 + mid2 - lo2 - hi2));
-    r[1] = darts_scalar_freeze(lo1 + darts_scalar_fqmul(zeta, hi1));
-    r[2] = darts_scalar_freeze(lo2 + darts_scalar_fqmul(zeta, hi2) + mid0 - lo0 - hi0);
-    r[3] = darts_scalar_freeze(mid1 - lo1 - hi1);
-}
-
-static inline __attribute__((always_inline))
 int poly_baseinv4(int32_t b[4], const int32_t a[4], int32_t zeta) {
     int r1;
     int32_t t0, t1, t2;
@@ -339,21 +312,171 @@ int poly_baseinv4(int32_t b[4], const int32_t a[4], int32_t zeta) {
 *              - const poly *a: pointer to first input polynomial
 *              - const poly *b: pointer to second input polynomial
 *************************************************/
+/* NEON pointwise basemul（DARTS v2 perf：NTT 腿 P1，移植自 opt-ml-dsa-a1-r1
+ * pointwise Montgomery 手法并按 DARTS 结构重设计）。
+ *
+ * DARTS 的 NTT 是部分 NTT：前向停在 len=4，剩余 X^4-zeta 块由
+ * poly_basemul4 的 Karatsuba 处理——这对应 ML-DSA 的 pointwise 层。
+ * 向量化形态：4 个相邻 basemul 块一组（16 系数），vld4q 转置装载使
+ * val[k][j] = 块 j 的第 k 系数；各块 zeta 依次为 (z,-z,z',-z')，经
+ * vzip 构造成逐通道 zeta 向量；Karatsuba 全部运算变为逐通道整数运算，
+ * vst4q 回写。每个系数经历的运算序列（同 zeta、同序、fqmul/freeze 精确
+ * 整数运算）与移除的标量 poly_basemul4 完全相同。
+ *
+ * 等价先验（DARTS 参数版）：
+ *  - QINV*Q ≡ 1 (mod 2^32)（q=130817: 4244570369；q=260609: 2820670977，
+ *    均已数值核验）。darts_neon_fqmul 与 darts_scalar_fqmul 对任意 int32
+ *    输入逐位相等：t ≡ p*QINV (mod 2^32) 时 t*Q ≡ p (mod 2^32)，故
+ *    (p - t*Q)>>32 = hi(p) - hi(t*Q) 无借位，NEON 的 hi-hi 形式精确。
+ *  - basemul 输入为 NTT 域系数 |a|,|b| < Q < 2^18（poly_ntt 后 freeze 到
+ *    [0,Q)）；内部中间量最大 |hi0+mid2-lo2-hi2| ≤ 4(Q+2^6) < 2^20，
+ *    fqmul 输出 ≤ Q+2^6，freeze 输入 ≤ 2(Q+2^6) < 2^20 < 2^30
+ *    （neon freeze 精确域 |a| < 2^30），全链无 int32 溢出，裕量 ≥ 2^10。
+ */
 void poly_basemul_montgomery(poly *r, const poly *a, const poly *b) {
     unsigned int i;
 #if DARTS_MODE == 128 || DARTS_MODE == 256
-    for (i = 0; i < N/8; i++) {
-        poly_basemul4(&r->coeffs[8*i], &a->coeffs[8*i], &b->coeffs[8*i], zetas[64+i]);
-        poly_basemul4(&r->coeffs[8*i+4], &a->coeffs[8*i+4], &b->coeffs[8*i+4], -zetas[64+i]);
-    }
-
+    const int32_t *zbase = &zetas[64];
+    const unsigned int ngroups = N/16;
 #elif DARTS_MODE == 512
-    for (i = 0; i < N/8; i++) {
-        poly_basemul4(&r->coeffs[8*i], &a->coeffs[8*i], &b->coeffs[8*i], zetas[128+i]);
-        poly_basemul4(&r->coeffs[8*i+4], &a->coeffs[8*i+4], &b->coeffs[8*i+4], -zetas[128+i]);
-    }
-
+    const int32_t *zbase = &zetas[128];
+    const unsigned int ngroups = N/16;
 #endif
+
+    for (i = 0; i < ngroups; i++) {
+        const int32_t *pa = &a->coeffs[16*i];
+        const int32_t *pb = &b->coeffs[16*i];
+        int32_t *pr = &r->coeffs[16*i];
+
+        /* 块 zeta 序 (z, -z, z', -z')：z = zbase[2i], z' = zbase[2i+1] */
+        int32x2_t zp = vld1_s32(&zbase[2*i]);
+        int32x4_t zdup = vcombine_s32(zp, zp);
+        int32x4_t vz = vzip1q_s32(zdup, vnegq_s32(zdup));
+
+        int32x4x4_t va4 = vld4q_s32(pa);
+        int32x4x4_t vb4 = vld4q_s32(pb);
+        int32x4_t va0 = va4.val[0], va1 = va4.val[1];
+        int32x4_t va2 = va4.val[2], va3 = va4.val[3];
+        int32x4_t vb0 = vb4.val[0], vb1 = vb4.val[1];
+        int32x4_t vb2 = vb4.val[2], vb3 = vb4.val[3];
+
+        int32x4_t lo0 = darts_neon_fqmul(va0, vb0);
+        int32x4_t lo2 = darts_neon_fqmul(va1, vb1);
+        int32x4_t lo1 = darts_neon_fqmul(vaddq_s32(va0, va1),
+                                         vaddq_s32(vb0, vb1));
+        lo1 = vsubq_s32(vsubq_s32(lo1, lo0), lo2);
+
+        int32x4_t hi0 = darts_neon_fqmul(va2, vb2);
+        int32x4_t hi2 = darts_neon_fqmul(va3, vb3);
+        int32x4_t hi1 = darts_neon_fqmul(vaddq_s32(va2, va3),
+                                         vaddq_s32(vb2, vb3));
+        hi1 = vsubq_s32(vsubq_s32(hi1, hi0), hi2);
+
+        int32x4_t mid0 = darts_neon_fqmul(vaddq_s32(va0, va2),
+                                          vaddq_s32(vb0, vb2));
+        int32x4_t mid2 = darts_neon_fqmul(vaddq_s32(va1, va3),
+                                          vaddq_s32(vb1, vb3));
+        int32x4_t mid1 = darts_neon_fqmul(
+            vaddq_s32(vaddq_s32(va0, va1), vaddq_s32(va2, va3)),
+            vaddq_s32(vaddq_s32(vb0, vb1), vaddq_s32(vb2, vb3)));
+        mid1 = vsubq_s32(vsubq_s32(mid1, mid0), mid2);
+
+        /* 与标量版逐字同结合序：(hi0+mid2)-lo2-hi2、((lo2+fq)+mid0)-lo0-hi0、
+         * (mid1-lo1)-hi1、(X-lo0)-lo2——运算序列与标量完全相同。 */
+        int32x4_t zt0 = darts_neon_fqmul(
+            vz, vsubq_s32(vsubq_s32(vaddq_s32(hi0, mid2), lo2), hi2));
+        int32x4_t zt2 = darts_neon_fqmul(vz, hi2);
+
+        int32x4_t r0 = darts_neon_freeze(vaddq_s32(lo0, zt0));
+        int32x4_t r1 = darts_neon_freeze(vaddq_s32(lo1, darts_neon_fqmul(vz, hi1)));
+        int32x4_t r2 = darts_neon_freeze(
+            vsubq_s32(vsubq_s32(vaddq_s32(vaddq_s32(lo2, zt2), mid0), lo0), hi0));
+        int32x4_t r3 = darts_neon_freeze(
+            vsubq_s32(vsubq_s32(mid1, lo1), hi1));
+
+        int32x4x4_t vr = { r0, r1, r2, r3 };
+        vst4q_s32(pr, vr);
+    }
+}
+
+/*************************************************
+* Name:        poly_basemul_acc_montgomery
+*
+* Description: r += a * b in NTT domain（DARTS v2 perf NTT 腿 P2：融合累加，
+*              移植自 opt-ml-dsa-a1-r1 P1 acc 形态）。每系数运算序列与
+*              「poly_basemul_montgomery 到临时 t 后 poly_add(r,r,t)」逐位
+*              相同：freeze 出值后逐通道 vadd 旧 r——仅省去临时 t 的整趟
+*              存取与二次系数遍历。组内先读 a/b/旧 r 后写 r，r 与 a/b 别名
+*              安全。
+**************************************************/
+void poly_basemul_acc_montgomery(poly *r, const poly *a, const poly *b) {
+    unsigned int i;
+#if DARTS_MODE == 128 || DARTS_MODE == 256
+    const int32_t *zbase = &zetas[64];
+    const unsigned int ngroups = N/16;
+#elif DARTS_MODE == 512
+    const int32_t *zbase = &zetas[128];
+    const unsigned int ngroups = N/16;
+#endif
+
+    for (i = 0; i < ngroups; i++) {
+        const int32_t *pa = &a->coeffs[16*i];
+        const int32_t *pb = &b->coeffs[16*i];
+        int32_t *pr = &r->coeffs[16*i];
+
+        int32x2_t zp = vld1_s32(&zbase[2*i]);
+        int32x4_t zdup = vcombine_s32(zp, zp);
+        int32x4_t vz = vzip1q_s32(zdup, vnegq_s32(zdup));
+
+        int32x4x4_t va4 = vld4q_s32(pa);
+        int32x4x4_t vb4 = vld4q_s32(pb);
+        int32x4_t va0 = va4.val[0], va1 = va4.val[1];
+        int32x4_t va2 = va4.val[2], va3 = va4.val[3];
+        int32x4_t vb0 = vb4.val[0], vb1 = vb4.val[1];
+        int32x4_t vb2 = vb4.val[2], vb3 = vb4.val[3];
+
+        int32x4_t lo0 = darts_neon_fqmul(va0, vb0);
+        int32x4_t lo2 = darts_neon_fqmul(va1, vb1);
+        int32x4_t lo1 = darts_neon_fqmul(vaddq_s32(va0, va1),
+                                         vaddq_s32(vb0, vb1));
+        lo1 = vsubq_s32(vsubq_s32(lo1, lo0), lo2);
+
+        int32x4_t hi0 = darts_neon_fqmul(va2, vb2);
+        int32x4_t hi2 = darts_neon_fqmul(va3, vb3);
+        int32x4_t hi1 = darts_neon_fqmul(vaddq_s32(va2, va3),
+                                         vaddq_s32(vb2, vb3));
+        hi1 = vsubq_s32(vsubq_s32(hi1, hi0), hi2);
+
+        int32x4_t mid0 = darts_neon_fqmul(vaddq_s32(va0, va2),
+                                          vaddq_s32(vb0, vb2));
+        int32x4_t mid2 = darts_neon_fqmul(vaddq_s32(va1, va3),
+                                          vaddq_s32(vb1, vb3));
+        int32x4_t mid1 = darts_neon_fqmul(
+            vaddq_s32(vaddq_s32(va0, va1), vaddq_s32(va2, va3)),
+            vaddq_s32(vaddq_s32(vb0, vb1), vaddq_s32(vb2, vb3)));
+        mid1 = vsubq_s32(vsubq_s32(mid1, mid0), mid2);
+
+        /* 与标量版逐字同结合序 */
+        int32x4_t zt0 = darts_neon_fqmul(
+            vz, vsubq_s32(vsubq_s32(vaddq_s32(hi0, mid2), lo2), hi2));
+        int32x4_t zt2 = darts_neon_fqmul(vz, hi2);
+
+        int32x4_t r0 = darts_neon_freeze(vaddq_s32(lo0, zt0));
+        int32x4_t r1 = darts_neon_freeze(vaddq_s32(lo1, darts_neon_fqmul(vz, hi1)));
+        int32x4_t r2 = darts_neon_freeze(
+            vsubq_s32(vsubq_s32(vaddq_s32(vaddq_s32(lo2, zt2), mid0), lo0), hi0));
+        int32x4_t r3 = darts_neon_freeze(
+            vsubq_s32(vsubq_s32(mid1, lo1), hi1));
+
+        /* 融合累加：freeze 出值后逐通道加旧 r（与 basemul→t→poly_add 同序） */
+        int32x4x4_t vacc = vld4q_s32(pr);
+        int32x4x4_t vr;
+        vr.val[0] = vaddq_s32(r0, vacc.val[0]);
+        vr.val[1] = vaddq_s32(r1, vacc.val[1]);
+        vr.val[2] = vaddq_s32(r2, vacc.val[2]);
+        vr.val[3] = vaddq_s32(r3, vacc.val[3]);
+        vst4q_s32(pr, vr);
+    }
 }
 
 /*************************************************

@@ -1,4 +1,5 @@
 #include "sign.h"
+#include "zeroize.h"
 #include "packing.h"
 #include "params.h"
 #include "poly.h"
@@ -96,6 +97,17 @@ reject:
     // 打包公钥和私钥
     pack_pk(pk, &A0, seed_A1);
     pack_sk(sk, pk, &s0, &s1, &e, key);
+
+    /* Erase secret key material before returning (CWE-459). */
+    darts_zeroize(seedbuf, sizeof(seedbuf));
+    darts_zeroize(&s0, sizeof(s0));
+    darts_zeroize(&s1, sizeof(s1));
+    darts_zeroize(&e, sizeof(e));
+    darts_zeroize(&neg_s0_hat, sizeof(neg_s0_hat));
+    darts_zeroize(&neg_s0_inv_hat, sizeof(neg_s0_inv_hat));
+    darts_zeroize(&s1hat, sizeof(s1hat));
+    darts_zeroize(&ehat, sizeof(ehat));
+    darts_zeroize(&state, sizeof(state));
 
     return 0;
 } 
@@ -269,6 +281,18 @@ reject:
     }
 
     *siglen = CRYPTO_SIGNATUREBYTES;
+
+    /* Erase secret signing material before returning (CWE-459). */
+    darts_zeroize(key, sizeof(key));
+    darts_zeroize(seedbuf, sizeof(seedbuf));
+    darts_zeroize(&s0, sizeof(s0));
+    darts_zeroize(&s1, sizeof(s1));
+    darts_zeroize(&e, sizeof(e));
+    darts_zeroize(&y1, sizeof(y1));
+    darts_zeroize(&y2, sizeof(y2));
+    darts_zeroize(&cs, sizeof(cs));
+    darts_zeroize(&ce, sizeof(ce));
+    darts_zeroize(&state, sizeof(state));
 
     return 0;
 } 

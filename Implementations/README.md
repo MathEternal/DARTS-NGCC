@@ -53,7 +53,7 @@ Implementations/
 | `ntt.c`, `fft.c` | Transform implementations |
 | `sampler.c`, `polyfix.c`, `fixpoint.c` | Sampling and fixed-point arithmetic |
 | `packing.c`, `encoding.c`, `rans_byte.h` | Serialization and rANS compression |
-| `symmetric.c`, `fips202.c` | Hash and extendable-output functions |
+| `symmetric.c` | Hash and extendable-output functions |
 | `KAT_SIG.c`, `PQCgenKAT_sign.c` | Known-answer-test programs |
 | `precomputations_rANS/` | rANS statistics and precomputed tables |
 | `test/` | Correctness tests and benchmarks |

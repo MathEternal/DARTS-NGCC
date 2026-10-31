@@ -19,9 +19,27 @@
  **************************************************/
 void poly_freeze(poly *a) {
     unsigned int i;
+    int32_t t;
 
-    for (i = 0; i < N; ++i)
-        a->coeffs[i] = freeze(a->coeffs[i]);
+    /* All call sites pass coefficients in (-2q, 2q):
+     *   - crypto_sign_signature: w = A*y1 + y2 (+/- round(z2), (1-b)c)
+     *     after one unreduced addition of a polynomial with |coeff| < q;
+     *     w0/w0_cb with the small (1-2b)c correction; round(z1)/round(z2)
+     *     with |coeff| < B < q;
+     *   - crypto_sign_verify: A*z1 + (q+1)/2*c*beta after the inverse NTT
+     *     (outputs in (-q, q)) plus one |coeff| < q summand;
+     *   - unpack_sig: recomposed z1 = LowBits + Decompress(HighBits),
+     *     a centered LowBits in (-q, q) plus a mid value in [0, q).
+     * For that domain the Barrett head of freeze() is unnecessary: two
+     * conditional operations (the tail of the reference freeze()) give
+     * the identical canonical representative in [0, q).
+     */
+    for (i = 0; i < N; ++i) {
+        t = a->coeffs[i];
+        t += (t >> 31) & DQ;       /* [0, 2q)  for t in (-2q, 2q) */
+        t -= ~((t - Q) >> 31) & Q; /* [0, q)   for t in [0, 2q)   */
+        a->coeffs[i] = t;
+    }
 }
 
 // 定义多项式的压缩与解压缩---------------------------------------------------------------------------------
@@ -162,8 +180,32 @@ void poly_mul_1_b(poly *r, const poly *a, uint8_t b) {
 * Arguments:   - poly *r: pointer to in/output polynomial
 **************************************************/
 void poly_ntt(poly *r) {
+    /* Lazy output: the forward NTT butterflies only reduce the twiddle
+     * products (each in (-q, q)), and every coefficient takes part in
+     * exactly one butterfly per layer, so coefficient magnitudes grow by
+     * less than q per layer. With log2(N/2) layers (7 for N = 512, 8 for
+     * N = 1024) and inputs bounded by |coeff| <= 2q (all call sites:
+     * ternary secrets s0/s1/e and negated copies in {-1,0,1}, challenge
+     * c in {-1,0,1}, round(y1) with |coeff| < B < q in the signing loop,
+     * z1 recomposed in crypto_sign_verify with |coeff| < 2q), outputs
+     * satisfy |coeff| < (2 + log2(N/2)) * q  (9q for N = 512, 10q for
+     * N = 1024). The separate canonicalization pass is dropped.
+     *
+     * Every consumer of the NTT representation is congruence-based and
+     * re-canonicalizes before values are used:
+     *   - basemul/baseinv use fqmul/montgomery_reduce arithmetic, valid
+     *     for |a| <= 2^31*q; products of two lazy sums stay below
+     *     (2*10q)^2 < 2^45, well inside that range, and basemul still
+     *     freeze()s each output to canonical [0, q);
+     *   - polyvecl_basemul_acc_montgomery adds canonical basemul outputs,
+     *     so the accumulator results and the inverse NTT inputs are the
+     *     same integers as in the reference pipeline;
+     *   - poly_mul_mont / polyveck_frommont reduce via montgomery_reduce
+     *     with the MONT/MONTSQ factor.
+     * The public key is packed through poly_q_pack, which canonicalizes
+     * every coefficient, so packed and hashed outputs are unchanged.
+     */
 	ntt(r->coeffs);
-	poly_freeze(r);
 }
 
 /*************************************************
@@ -314,7 +356,12 @@ void poly_neg(poly *r) {
 /*************************************************
  * Name:        poly_q_pack
  *
- * Description: Pack polynomial with coefficients in [0, Q - 1].
+ * Description: Pack polynomial with coefficients in (-Q, Q).
+ *              Inputs in [0, Q - 1] are packed as-is; negative inputs
+ *              (the polyveck_frommont output range of the only caller,
+ *              pack_pk) are lifted by a single conditional addition of Q,
+ *              which is bit-identical to the previous full freeze() for
+ *              every input in the documented range.
  *
  * Arguments:   - uint8_t *r: pointer to output byte array with at least
  *                            POLY_Q_PACKEDBYTES bytes
@@ -326,14 +373,14 @@ void poly_q_pack(uint8_t *r, const poly *a) {
 #if DARTS_MODE == 128 || DARTS_MODE == 256
     // q = 130817, 17 bits
     for (unsigned int i = 0; i < N; i += 8) {
-        uint32_t t0 = (uint32_t)freeze(a->coeffs[i + 0]) & 0x1FFFFu;
-        uint32_t t1 = (uint32_t)freeze(a->coeffs[i + 1]) & 0x1FFFFu;
-        uint32_t t2 = (uint32_t)freeze(a->coeffs[i + 2]) & 0x1FFFFu;
-        uint32_t t3 = (uint32_t)freeze(a->coeffs[i + 3]) & 0x1FFFFu;
-        uint32_t t4 = (uint32_t)freeze(a->coeffs[i + 4]) & 0x1FFFFu;
-        uint32_t t5 = (uint32_t)freeze(a->coeffs[i + 5]) & 0x1FFFFu;
-        uint32_t t6 = (uint32_t)freeze(a->coeffs[i + 6]) & 0x1FFFFu;
-        uint32_t t7 = (uint32_t)freeze(a->coeffs[i + 7]) & 0x1FFFFu;
+        uint32_t t0 = (uint32_t)caddq(a->coeffs[i + 0]) & 0x1FFFFu;
+        uint32_t t1 = (uint32_t)caddq(a->coeffs[i + 1]) & 0x1FFFFu;
+        uint32_t t2 = (uint32_t)caddq(a->coeffs[i + 2]) & 0x1FFFFu;
+        uint32_t t3 = (uint32_t)caddq(a->coeffs[i + 3]) & 0x1FFFFu;
+        uint32_t t4 = (uint32_t)caddq(a->coeffs[i + 4]) & 0x1FFFFu;
+        uint32_t t5 = (uint32_t)caddq(a->coeffs[i + 5]) & 0x1FFFFu;
+        uint32_t t6 = (uint32_t)caddq(a->coeffs[i + 6]) & 0x1FFFFu;
+        uint32_t t7 = (uint32_t)caddq(a->coeffs[i + 7]) & 0x1FFFFu;
 
         r[out +  0] = (uint8_t)(t0);
         r[out +  1] = (uint8_t)(t0 >> 8);
@@ -359,10 +406,10 @@ void poly_q_pack(uint8_t *r, const poly *a) {
 #elif DARTS_MODE == 512
     // q = 260609, 18 bits
     for (unsigned int i = 0; i < N; i += 4) {
-        uint32_t t0 = (uint32_t)freeze(a->coeffs[i + 0]) & 0x3FFFFu;
-        uint32_t t1 = (uint32_t)freeze(a->coeffs[i + 1]) & 0x3FFFFu;
-        uint32_t t2 = (uint32_t)freeze(a->coeffs[i + 2]) & 0x3FFFFu;
-        uint32_t t3 = (uint32_t)freeze(a->coeffs[i + 3]) & 0x3FFFFu;
+        uint32_t t0 = (uint32_t)caddq(a->coeffs[i + 0]) & 0x3FFFFu;
+        uint32_t t1 = (uint32_t)caddq(a->coeffs[i + 1]) & 0x3FFFFu;
+        uint32_t t2 = (uint32_t)caddq(a->coeffs[i + 2]) & 0x3FFFFu;
+        uint32_t t3 = (uint32_t)caddq(a->coeffs[i + 3]) & 0x3FFFFu;
 
         r[out + 0] = (uint8_t)(t0);
         r[out + 1] = (uint8_t)(t0 >> 8);
@@ -623,6 +670,17 @@ void poly_pack_compressed(uint8_t *r, const poly *a) {
  *                            POLY_LOWBITS_PACKEDBYTES bytes
  *              - const poly *a: pointer to input polynomial
  **************************************************/
+/* NOTE on variant equivalence: for DARTS_MODE 128 and 256 the low-bits
+ * decomposition x' = base*x1 + x2 (base = 8 resp. 16) is computed with
+ * signed int32_t division/modulo (x'/base, x'%base) in the reference
+ * implementation and with unsigned uint32_t shifts/masks (x' >> 3, x' & 7
+ * resp. x' >> 4, x' & 15) in the AVX2 implementation. On the valid input
+ * domain x' = x + offset in [0, 2*offset] the two are value-for-value
+ * identical (base is a power of two and the operands are non-negative).
+ * They diverge on out-of-domain negative inputs: C99 signed division
+ * truncates toward zero ((-1)/8 == 0, (-1)%8 == -1) while the unsigned
+ * path wraps to large values. Both implementations rely on the upstream
+ * invariant that this function is only called with in-domain coefficients. */
 void poly_pack_lowbits(uint8_t *r, const poly *a) {
 #if DARTS_MODE == 128
     /* 128-bits security: x in [-64,64] -> [0,128] -> 8*x1 + x2 */

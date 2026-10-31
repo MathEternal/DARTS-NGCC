@@ -269,10 +269,10 @@ void ntt(int32_t r[N]) {
  **************************************************/
 void invntt_tomont(int32_t r[N]) {
     unsigned int start, len, j, k;
-    int32_t t, zeta;
+    int32_t t, d, zeta;
 
     k = 0;
-    for (len = 4; len <= N/2; len <<= 1) {
+    for (len = 4; len <= N/4; len <<= 1) {
         for (start = 0; start < N; start = j +len) {
             zeta = zetas_inv[k++];
             for (j = start; j < start + len; ++j) {
@@ -283,9 +283,39 @@ void invntt_tomont(int32_t r[N]) {
             }
         }
     }
-    
-    for (j = 0; j < N; ++j) {
-        r[j] = fqmul(r[j], zetas_inv[N/4 - 1]);
+
+    /* Final layer (len = N/2, single block) fused with the global scaling
+     * pass. The reference computes the last layer and then rescales all N
+     * outputs in a second pass over the whole array:
+     *   v_j     = r[j] + r[j+h];                     (h = N/2)
+     *   v_{j+h} = fqmul(zeta, r[j] - r[j+h]);
+     *   out_i   = fqmul(v_i, f);      f = zetas_inv[N/4 - 1]
+     * Here both passes are fused into a single loop over the N/2
+     * butterflies, preserving the exact operation sequence per output:
+     *   out_j     = fqmul(r[j] + r[j+h], f);
+     *     (the int32 sum r[j] + r[j+h] equals v_j exactly, so the int64
+     *      product handed to montgomery_reduce is identical to the
+     *      reference's)
+     *   out_{j+h} = fqmul(fqmul(zeta, r[j] - r[j+h]), f);
+     * The outputs are therefore bit-identical to the reference while one
+     * full memory pass over the array (and the intermediate store/reload
+     * of all N coefficients between the two passes) is removed.
+     *
+     * Note: folding the scale into a single Montgomery multiplication per
+     * bottom output (out = fqmul(zeta*f*R^{-1} mod q, r[j] - r[j+h])) was
+     * evaluated and rejected: it is only congruent mod q, not bit-exact --
+     * the two-step reference chain truncates to int32 in between, and the
+     * composed single step lands on a representative differing by +-q on
+     * ~1e-6 of coefficients. Downstream, polyfix_add consumes invntt
+     * outputs as plain integers (c = a + LN*b, no reduction), so such a
+     * +-q difference would change signature outputs on unlucky inputs.
+     */
+    zeta = zetas_inv[k];
+    for (j = 0; j < N/2; ++j) {
+        t = r[j + N/2];
+        d = r[j] - t;
+        r[j] = fqmul(r[j] + t, zetas_inv[N/4 - 1]);
+        r[j + N/2] = fqmul(fqmul(zeta, d), zetas_inv[N/4 - 1]);
     }
 }
 

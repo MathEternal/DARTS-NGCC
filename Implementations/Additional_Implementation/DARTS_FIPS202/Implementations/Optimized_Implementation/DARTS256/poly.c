@@ -311,11 +311,11 @@ void poly_caddq(poly *a) {
 
     for(i = 0; i < N / 8; ++i) {
 
-        f = _mm256_load_si256((__m256i *)&a->coeffs[8 * i]);
+        f = _mm256_loadu_si256((__m256i *)&a->coeffs[8 * i]);
         g = _mm256_blendv_epi32(zero, q, f);
         f = _mm256_add_epi32(f, g);
         
-        _mm256_store_si256((__m256i *)&a->coeffs[8 * i], f);
+        _mm256_storeu_si256((__m256i *)&a->coeffs[8 * i], f);
     }
 }
 
@@ -404,7 +404,7 @@ int poly_baseinv(poly *b, const poly *a) {
         __m256i vzeta = _mm256_set_epi32(-zeta, -zeta, -zeta, -zeta, 
                                           zeta,  zeta,  zeta,  zeta);
         __m256i va = _mm256_loadu_si256((__m256i *)&a->coeffs[8 * i]);
-        __m256i vb = vzero;
+        __m256i vb;
         __m256i a0 = _mm256_shuffle_epi32(va, 0x00);
         __m256i a1 = _mm256_shuffle_epi32(va, 0x55);
         __m256i a2 = _mm256_shuffle_epi32(va, 0xAA);
@@ -423,12 +423,13 @@ int poly_baseinv(poly *b, const poly *a) {
         __m256i t2 = fqmul_avx(t1, t1);
         t2 = _mm256_sub_epi32(fqmul_avx(t0, t0), fqmul_avx(t2, vzeta));
 
+        /* Branchless degenerate-group handling: fold the zero-test into
+         * the result accumulator instead of branching on secret data, and
+         * always run the inversion.  fqinv(0) == 0, so a degenerate group
+         * still yields the all-zero output block the branch used to store;
+         * this matches the mask form of the Reference/NEON trees. */
         __m256i cmp = _mm256_cmpeq_epi32(t2, vzero);
-        if (!_mm256_testz_si256(cmp, cmp)) {
-            result -= 1; 
-            _mm256_storeu_si256((__m256i *)&b->coeffs[8 * i], vb);
-            continue; 
-        }
+        result -= !_mm256_testz_si256(cmp, cmp);
 
         t2 = fqinv_avx(t2);
         t0 = montgomery_reduce_avx(fqmul_avx(t0, t2));
@@ -577,18 +578,43 @@ void poly_q_pack(uint8_t *r, const poly *a) {
     }
 #endif
 }
+
+static __m256i unpack_q_window(const uint8_t *p,
+                               const __m256i shufbidx,
+                               const __m256i srlvdidx,
+                               const __m256i mask) {
+    // 1. 一次性吸入 32 字节
+    __m256i f = _mm256_loadu_si256((const __m256i *)p);
+    // 2. 跨通道复制：将字节 8~15 复制到上通道
+    f = _mm256_permute4x64_epi64(f, 0x94);
+    // 3. 字节重排
+    f = _mm256_shuffle_epi8(f, shufbidx);
+    // 4. 可变位移
+    f = _mm256_srlv_epi32(f, srlvdidx);
+    // 5. 掩码截断
+    return _mm256_and_si256(f, mask);
+}
+
 /*************************************************
  * Name:        poly_q_unpack
  *
  * Description: Unpack polynomial with coefficients in [0, Q - 1].
  *
  * Arguments:   - poly *r: pointer to output polynomial
- *              - const uint8_t *a: pointer to input byte array with 
+ *              - const uint8_t *a: pointer to input byte array with
  *                                  at least POLY_Q_PACKEDBYTES bytes
  **************************************************/
 void poly_q_unpack(poly *r, const uint8_t *a) {
     unsigned int i;
     __m256i f;
+    /* Each group of 8 coefficients occupies 17 bytes (q = 130817) or
+       18 bytes (q = 260609), but the vector load reads a full 32-byte
+       window. The windows of all groups except the last lie fully
+       inside the input; the last group is copied into a zero-padded
+       scratch buffer first so the load stays in bounds. The shuffle
+       mask never uses bytes past the end of the group, so the padding
+       does not change the result. */
+    uint8_t tail[32] = {0};
 
 #if SIGN_MODE == 128 || SIGN_MODE == 256
     // q = 130817, 17 bits
@@ -601,40 +627,33 @@ void poly_q_unpack(poly *r, const uint8_t *a) {
     const __m256i srlvdidx = _mm256_setr_epi32(0, 1, 2, 3, 4, 5, 6, 7);
     const __m256i mask = _mm256_set1_epi32(0x1FFFF);
 
-    for (i = 0; i < N / 8; i++) {
-        // 1. 一次性吸入 32 字节
-        f = _mm256_loadu_si256((__m256i *)&a[17 * i]);
-        // 2. 跨通道复制：将字节 8~15 复制到上通道
-        f = _mm256_permute4x64_epi64(f, 0x94);
-        // 3. 字节重排
-        f = _mm256_shuffle_epi8(f, shufbidx);
-        // 4. 可变位移
-        f = _mm256_srlv_epi32(f, srlvdidx);
-        // 5. 掩码截断
-        f = _mm256_and_si256(f, mask);
+    for (i = 0; i + 1 < N / 8; i++) {
+        f = unpack_q_window(&a[17 * i], shufbidx, srlvdidx, mask);
         // 6. 输出 8 个 32-bit 整数
         _mm256_storeu_si256((__m256i *)&r->coeffs[8 * i], f);
     }
+    memcpy(tail, &a[17 * i], 17);
+    f = unpack_q_window(tail, shufbidx, srlvdidx, mask);
+    _mm256_storeu_si256((__m256i *)&r->coeffs[8 * i], f);
 
 #elif SIGN_MODE == 512
     // q = 260609, 18 bits
     // 注意：18 bits 时，上通道需要从字节 9 开始，所以掩码与下通道不同
     const __m256i shufbidx = _mm256_set_epi8(
-        -1, 9, 8, 7, -1, 7, 6, 5, -1, 5, 4, 3, -1, 3, 2, 1, // Upper lane 
+        -1, 9, 8, 7, -1, 7, 6, 5, -1, 5, 4, 3, -1, 3, 2, 1, // Upper lane
         -1, 8, 7, 6, -1, 6, 5, 4, -1, 4, 3, 2, -1, 2, 1, 0  // Lower lane
     );
     // 18 bits 的移位是 0,2,4,6 的循环
     const __m256i srlvdidx = _mm256_setr_epi32(0, 2, 4, 6, 0, 2, 4, 6);
     const __m256i mask = _mm256_set1_epi32(0x3FFFF);
 
-    for (i = 0; i < N / 8; i++) {
-        f = _mm256_loadu_si256((__m256i *)&a[18 * i]);
-        f = _mm256_permute4x64_epi64(f, 0x94);
-        f = _mm256_shuffle_epi8(f, shufbidx);
-        f = _mm256_srlv_epi32(f, srlvdidx);
-        f = _mm256_and_si256(f, mask);
+    for (i = 0; i + 1 < N / 8; i++) {
+        f = unpack_q_window(&a[18 * i], shufbidx, srlvdidx, mask);
         _mm256_storeu_si256((__m256i *)&r->coeffs[8 * i], f);
     }
+    memcpy(tail, &a[18 * i], 18);
+    f = unpack_q_window(tail, shufbidx, srlvdidx, mask);
+    _mm256_storeu_si256((__m256i *)&r->coeffs[8 * i], f);
 #endif
 }
 
@@ -834,10 +853,10 @@ void poly_pack_compressed(uint8_t *r, const poly *a) {
 #endif
 
     for (int i = 0; i < N; i += 32) {
-        __m256i v0 = _mm256_and_si256(_mm256_load_si256((const __m256i *)&a->coeffs[i + 0]),  m_mask);
-        __m256i v1 = _mm256_and_si256(_mm256_load_si256((const __m256i *)&a->coeffs[i + 8]),  m_mask);
-        __m256i v2 = _mm256_and_si256(_mm256_load_si256((const __m256i *)&a->coeffs[i + 16]), m_mask);
-        __m256i v3 = _mm256_and_si256(_mm256_load_si256((const __m256i *)&a->coeffs[i + 24]), m_mask);
+        __m256i v0 = _mm256_and_si256(_mm256_loadu_si256((const __m256i *)&a->coeffs[i + 0]),  m_mask);
+        __m256i v1 = _mm256_and_si256(_mm256_loadu_si256((const __m256i *)&a->coeffs[i + 8]),  m_mask);
+        __m256i v2 = _mm256_and_si256(_mm256_loadu_si256((const __m256i *)&a->coeffs[i + 16]), m_mask);
+        __m256i v3 = _mm256_and_si256(_mm256_loadu_si256((const __m256i *)&a->coeffs[i + 24]), m_mask);
 
 
 #if D == 10

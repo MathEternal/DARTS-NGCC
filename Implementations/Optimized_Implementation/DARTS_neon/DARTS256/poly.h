@@ -66,6 +66,9 @@ void poly_caddq(poly *r);
 #define poly_basemul_montgomery DARTS_NAMESPACE(poly_basemul_montgomery) // 乘法
 void poly_basemul_montgomery(poly *r, const poly *a, const poly *b);
 
+#define poly_basemul_acc_montgomery DARTS_NAMESPACE(poly_basemul_acc_montgomery) // 乘法累加（融合）
+void poly_basemul_acc_montgomery(poly *r, const poly *a, const poly *b);
+
 #define poly_baseinv DARTS_NAMESPACE(poly_baseinv) // 乘法逆元
 int poly_baseinv(poly *b, const poly *a);
 
