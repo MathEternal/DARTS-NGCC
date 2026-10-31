@@ -310,11 +310,11 @@ void poly_caddq(poly *a) {
 
     for(i = 0; i < N / 8; ++i) {
 
-        f = _mm256_load_si256((__m256i *)&a->coeffs[8 * i]);
+        f = _mm256_loadu_si256((__m256i *)&a->coeffs[8 * i]);
         g = _mm256_blendv_epi32(zero, q, f);
         f = _mm256_add_epi32(f, g);
         
-        _mm256_store_si256((__m256i *)&a->coeffs[8 * i], f);
+        _mm256_storeu_si256((__m256i *)&a->coeffs[8 * i], f);
     }
 }
 
@@ -834,10 +834,10 @@ void poly_pack_compressed(uint8_t *r, const poly *a) {
 #endif
 
     for (int i = 0; i < N; i += 32) {
-        __m256i v0 = _mm256_and_si256(_mm256_load_si256((const __m256i *)&a->coeffs[i + 0]),  m_mask);
-        __m256i v1 = _mm256_and_si256(_mm256_load_si256((const __m256i *)&a->coeffs[i + 8]),  m_mask);
-        __m256i v2 = _mm256_and_si256(_mm256_load_si256((const __m256i *)&a->coeffs[i + 16]), m_mask);
-        __m256i v3 = _mm256_and_si256(_mm256_load_si256((const __m256i *)&a->coeffs[i + 24]), m_mask);
+        __m256i v0 = _mm256_and_si256(_mm256_loadu_si256((const __m256i *)&a->coeffs[i + 0]),  m_mask);
+        __m256i v1 = _mm256_and_si256(_mm256_loadu_si256((const __m256i *)&a->coeffs[i + 8]),  m_mask);
+        __m256i v2 = _mm256_and_si256(_mm256_loadu_si256((const __m256i *)&a->coeffs[i + 16]), m_mask);
+        __m256i v3 = _mm256_and_si256(_mm256_loadu_si256((const __m256i *)&a->coeffs[i + 24]), m_mask);
 
 
 #if D == 10
