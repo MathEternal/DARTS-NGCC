@@ -577,18 +577,43 @@ void poly_q_pack(uint8_t *r, const poly *a) {
     }
 #endif
 }
+
+static __m256i unpack_q_window(const uint8_t *p,
+                               const __m256i shufbidx,
+                               const __m256i srlvdidx,
+                               const __m256i mask) {
+    // 1. 一次性吸入 32 字节
+    __m256i f = _mm256_loadu_si256((const __m256i *)p);
+    // 2. 跨通道复制：将字节 8~15 复制到上通道
+    f = _mm256_permute4x64_epi64(f, 0x94);
+    // 3. 字节重排
+    f = _mm256_shuffle_epi8(f, shufbidx);
+    // 4. 可变位移
+    f = _mm256_srlv_epi32(f, srlvdidx);
+    // 5. 掩码截断
+    return _mm256_and_si256(f, mask);
+}
+
 /*************************************************
  * Name:        poly_q_unpack
  *
  * Description: Unpack polynomial with coefficients in [0, Q - 1].
  *
  * Arguments:   - poly *r: pointer to output polynomial
- *              - const uint8_t *a: pointer to input byte array with 
+ *              - const uint8_t *a: pointer to input byte array with
  *                                  at least POLY_Q_PACKEDBYTES bytes
  **************************************************/
 void poly_q_unpack(poly *r, const uint8_t *a) {
     unsigned int i;
     __m256i f;
+    /* Each group of 8 coefficients occupies 17 bytes (q = 130817) or
+       18 bytes (q = 260609), but the vector load reads a full 32-byte
+       window. The windows of all groups except the last lie fully
+       inside the input; the last group is copied into a zero-padded
+       scratch buffer first so the load stays in bounds. The shuffle
+       mask never uses bytes past the end of the group, so the padding
+       does not change the result. */
+    uint8_t tail[32] = {0};
 
 #if DARTS_MODE == 128 || DARTS_MODE == 256
     // q = 130817, 17 bits
@@ -601,40 +626,33 @@ void poly_q_unpack(poly *r, const uint8_t *a) {
     const __m256i srlvdidx = _mm256_setr_epi32(0, 1, 2, 3, 4, 5, 6, 7);
     const __m256i mask = _mm256_set1_epi32(0x1FFFF);
 
-    for (i = 0; i < N / 8; i++) {
-        // 1. 一次性吸入 32 字节
-        f = _mm256_loadu_si256((__m256i *)&a[17 * i]);
-        // 2. 跨通道复制：将字节 8~15 复制到上通道
-        f = _mm256_permute4x64_epi64(f, 0x94);
-        // 3. 字节重排
-        f = _mm256_shuffle_epi8(f, shufbidx);
-        // 4. 可变位移
-        f = _mm256_srlv_epi32(f, srlvdidx);
-        // 5. 掩码截断
-        f = _mm256_and_si256(f, mask);
+    for (i = 0; i + 1 < N / 8; i++) {
+        f = unpack_q_window(&a[17 * i], shufbidx, srlvdidx, mask);
         // 6. 输出 8 个 32-bit 整数
         _mm256_storeu_si256((__m256i *)&r->coeffs[8 * i], f);
     }
+    memcpy(tail, &a[17 * i], 17);
+    f = unpack_q_window(tail, shufbidx, srlvdidx, mask);
+    _mm256_storeu_si256((__m256i *)&r->coeffs[8 * i], f);
 
 #elif DARTS_MODE == 512
     // q = 260609, 18 bits
     // 注意：18 bits 时，上通道需要从字节 9 开始，所以掩码与下通道不同
     const __m256i shufbidx = _mm256_set_epi8(
-        -1, 9, 8, 7, -1, 7, 6, 5, -1, 5, 4, 3, -1, 3, 2, 1, // Upper lane 
+        -1, 9, 8, 7, -1, 7, 6, 5, -1, 5, 4, 3, -1, 3, 2, 1, // Upper lane
         -1, 8, 7, 6, -1, 6, 5, 4, -1, 4, 3, 2, -1, 2, 1, 0  // Lower lane
     );
     // 18 bits 的移位是 0,2,4,6 的循环
     const __m256i srlvdidx = _mm256_setr_epi32(0, 2, 4, 6, 0, 2, 4, 6);
     const __m256i mask = _mm256_set1_epi32(0x3FFFF);
 
-    for (i = 0; i < N / 8; i++) {
-        f = _mm256_loadu_si256((__m256i *)&a[18 * i]);
-        f = _mm256_permute4x64_epi64(f, 0x94);
-        f = _mm256_shuffle_epi8(f, shufbidx);
-        f = _mm256_srlv_epi32(f, srlvdidx);
-        f = _mm256_and_si256(f, mask);
+    for (i = 0; i + 1 < N / 8; i++) {
+        f = unpack_q_window(&a[18 * i], shufbidx, srlvdidx, mask);
         _mm256_storeu_si256((__m256i *)&r->coeffs[8 * i], f);
     }
+    memcpy(tail, &a[18 * i], 18);
+    f = unpack_q_window(tail, shufbidx, srlvdidx, mask);
+    _mm256_storeu_si256((__m256i *)&r->coeffs[8 * i], f);
 #endif
 }
 
