@@ -2,7 +2,16 @@
 
 This repository contains the revised specification, implementations, and test vectors for the DARTS lattice-based digital signature scheme.
 
-## Update
+## Updates
+
+### 2026-11-22 — Reference and AVX2 implementations
+
+- Signing now reserves a separate nonce for the branch bits so that retries use a fresh nonce for the next mask. The SM3 and FIPS 202 test vectors have been regenerated for all three parameter sets.
+- The ICCS verification wrappers now reject public keys of incorrect length before decoding. The AVX2 decoders now read only the remaining bytes at the end of a public key.
+
+The NEON implementation retains its previous behavior.
+
+### 2026-10-30 — Version 2.0
 
 Security analysis identified a bias in the distribution of `b` caused by a missing factor of 2 in Step 9 of Algorithm 7. This release changes the comparison from
 
