@@ -238,7 +238,7 @@ uint64_t polyfixveclk_sqnorm2(const polyfixvecl *a, const polyfixveck *b) {
  *              - const uint8_t seed[CRHBYTES]: seed for sampling
  *              - const uint16_t nonce: nonce for sampling
  *
- * Returns:     - the number of used bytes from b
+ * Returns:     - the next unused nonce
  **************************************************/
 uint16_t polyfixveclk_sample_hyperball(polyfixvecl *y1, polyfixveck *y2, uint8_t *b,
                                        const uint8_t seed[CRHBYTES],
@@ -294,6 +294,8 @@ uint16_t polyfixveclk_sample_hyperball(polyfixvecl *y1, polyfixveck *y2, uint8_t
       tmp[CRHBYTES + 0] = ni >> 0;
       tmp[CRHBYTES + 1] = ni >> 8;
       sm3_shake256(b, 1, tmp, CRHBYTES+2);
+      /* Reserve this nonce for b/b' so the next mask uses a fresh stream. */
+      ni++;
     }
 
     return ni;

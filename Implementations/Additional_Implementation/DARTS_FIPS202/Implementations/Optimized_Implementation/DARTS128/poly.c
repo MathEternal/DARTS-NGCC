@@ -603,7 +603,14 @@ void poly_q_unpack(poly *r, const uint8_t *a) {
 
     for (i = 0; i < N / 8; i++) {
         // 1. 一次性吸入 32 字节
-        f = _mm256_loadu_si256((__m256i *)&a[17 * i]);
+        if (i + 1 < N / 8) {
+            f = _mm256_loadu_si256((const __m256i *)&a[17 * i]);
+        } else {
+            /* The last group has no readable padding after the polynomial. */
+            uint8_t tail[32] = {0};
+            memcpy(tail, &a[17 * i], 17);
+            f = _mm256_loadu_si256((const __m256i *)tail);
+        }
         // 2. 跨通道复制：将字节 8~15 复制到上通道
         f = _mm256_permute4x64_epi64(f, 0x94);
         // 3. 字节重排
@@ -628,7 +635,14 @@ void poly_q_unpack(poly *r, const uint8_t *a) {
     const __m256i mask = _mm256_set1_epi32(0x3FFFF);
 
     for (i = 0; i < N / 8; i++) {
-        f = _mm256_loadu_si256((__m256i *)&a[18 * i]);
+        if (i + 1 < N / 8) {
+            f = _mm256_loadu_si256((const __m256i *)&a[18 * i]);
+        } else {
+            /* The last group has no readable padding after the polynomial. */
+            uint8_t tail[32] = {0};
+            memcpy(tail, &a[18 * i], 18);
+            f = _mm256_loadu_si256((const __m256i *)tail);
+        }
         f = _mm256_permute4x64_epi64(f, 0x94);
         f = _mm256_shuffle_epi8(f, shufbidx);
         f = _mm256_srlv_epi32(f, srlvdidx);

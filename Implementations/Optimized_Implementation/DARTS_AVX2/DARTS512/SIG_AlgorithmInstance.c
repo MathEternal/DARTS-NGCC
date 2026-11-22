@@ -67,7 +67,9 @@ int sig_verify(
 	unsigned char *sn, unsigned long long sn_len_bytes,
 	unsigned char *m, unsigned long long m_len_bytes)
 {
-	(void)pk_len_bytes; // ICCS API 传入公钥长度，内部不需要使用
+	if (pk_len_bytes != CRYPTO_PUBLICKEYBYTES) {
+		return -1;
+	}
 
 	return crypto_sign_verify(sn, (size_t)sn_len_bytes, m, (size_t)m_len_bytes, pk);
 }
